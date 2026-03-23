@@ -51,11 +51,14 @@ const RATE_LIMIT_MS = 1500;
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 5000;
 const USER_AGENT =
-  "AnsvarBWBCrawler/1.0 (+https://github.com/Ansvar-Systems/austrian-competition-mcp)";
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
-/** Decision list: TYPO3 paginated listing. */
-const DECISIONS_LIST_URL =
-  `${BASE_URL}/kartelle_marktmachtmissbrauch/entscheidungen`;
+/** Kartellgericht (Cartel Court) decisions — paginated TYPO3 news listing. */
+const DECISIONS_KG_URL =
+  `${BASE_URL}/kartelle-marktmachtmissbrauch/entscheidungen/entscheidungen-des-kartellgerichts`;
+// Note: Kartellobergericht (Supreme Cartel Court) decisions are at
+// /kartelle-marktmachtmissbrauch/entscheidungen/entscheidungen-des-kartellobergerichts
+// but use a flat table (no detail pages). Could be added as a table extraction step.
 
 /** Merger filings are grouped by year. Crawl from 2002 (BWB founded) to now. */
 const MERGER_START_YEAR = 2002;
@@ -146,13 +149,17 @@ async function rateLimitedFetch(url: string): Promise<string | null> {
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
       lastRequestTime = Date.now();
+      const headers: Record<string, string> = {
+        "User-Agent": USER_AGENT,
+        Accept:
+          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "de-AT,de;q=0.9,en;q=0.5",
+      };
+      if (sucuriCookie) {
+        headers["Cookie"] = sucuriCookie;
+      }
       const response = await fetch(url, {
-        headers: {
-          "User-Agent": USER_AGENT,
-          Accept:
-            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-          "Accept-Language": "de-AT,de;q=0.9,en;q=0.5",
-        },
+        headers,
         redirect: "follow",
         signal: AbortSignal.timeout(30_000),
       });
@@ -193,6 +200,102 @@ function sleep(ms: number): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// Sucuri WAF challenge solver
+// ---------------------------------------------------------------------------
+
+/**
+ * The BWB site is behind Sucuri/Cloudproxy WAF. Initial requests receive a
+ * 307 with a JS challenge that computes a cookie value. We must:
+ *   1. Fetch the challenge page (307 with inline JS)
+ *   2. Decode the Base64 payload to extract the cookie name and value
+ *   3. Store the cookie for all subsequent requests
+ *
+ * The challenge JS sets document.cookie = '<name>=<value>' then reloads.
+ * We evaluate the value-building JS in a sandboxed context (no DOM needed).
+ */
+
+let sucuriCookie: string | null = null;
+
+async function solveSucuriChallenge(): Promise<void> {
+  console.log("  Solving Sucuri WAF challenge...");
+  const response = await fetch(BASE_URL, {
+    headers: {
+      "User-Agent": USER_AGENT,
+      Accept:
+        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "de-AT,de;q=0.9,en;q=0.5",
+    },
+    redirect: "manual",
+  });
+
+  const html = await response.text();
+
+  // Extract the Base64 payload from the Sucuri challenge script
+  const b64Match = html.match(/S='([A-Za-z0-9+/=]+)'/);
+  if (!b64Match) {
+    console.warn("  [WARN] No Sucuri challenge found (site may not require it).");
+    return;
+  }
+
+  // Decode the Base64 payload
+  const decoded = Buffer.from(b64Match[1]!, "base64").toString("utf-8");
+
+  // The decoded JS has two parts:
+  //   1. Variable assignment building the cookie value, e.g.  m='e' + '2' + ...
+  //   2. document.cookie = '<name>=' + <var> + ';path=/;max-age=86400'
+  // We need to extract the cookie name and compute the value.
+
+  // Extract cookie name from the document.cookie assignment
+  const cookieNameChars = decoded.match(
+    /document\.cookie='([^']+)'|document\.cookie=([^;]+;)/,
+  );
+  // The name is built char-by-char with + concatenation. Easier to regex the
+  // reconstructed string after the assignment.
+  const nameMatch = decoded.match(
+    /document\.cookie=((?:'[^']*'\+)*'[^']*')\s*\+\s*"="\s*\+/,
+  );
+  let cookieName: string;
+  if (nameMatch) {
+    // Evaluate the concatenation of single-quoted strings
+    cookieName = nameMatch[1]!.split("+").map((s) => s.trim().replace(/^'|'$/g, "")).join("");
+  } else {
+    // Fallback: try to find sucuri_cloudproxy_uuid pattern directly
+    const directName = decoded.match(/sucuri_cloudproxy_uuid_[a-f0-9]+/);
+    if (directName) {
+      cookieName = directName[0]!;
+    } else {
+      console.warn("  [WARN] Could not extract Sucuri cookie name.");
+      return;
+    }
+  }
+
+  // Extract the variable assignment (first statement) and evaluate it to get
+  // the cookie value. The JS looks like:  f='e' + "2" + String.fromCharCode(98) + ...
+  const varName = decoded.charAt(0);
+  const assignEnd = decoded.indexOf(";document.cookie");
+  if (assignEnd < 0) {
+    console.warn("  [WARN] Could not parse Sucuri challenge script.");
+    return;
+  }
+  const assignment = decoded.slice(0, assignEnd + 1); // include trailing ;
+
+  // Evaluate in a minimal sandbox (only String.fromCharCode is needed)
+  let cookieValue: string;
+  try {
+    const fn = new Function(`${assignment} return ${varName};`);
+    cookieValue = fn() as string;
+  } catch (err) {
+    console.warn(
+      `  [WARN] Failed to evaluate Sucuri challenge: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return;
+  }
+
+  sucuriCookie = `${cookieName}=${cookieValue}`;
+  console.log(`  Sucuri challenge solved. Cookie: ${cookieName}=<${cookieValue.length} chars>`);
+}
+
+// ---------------------------------------------------------------------------
 // State management (for --resume)
 // ---------------------------------------------------------------------------
 
@@ -226,53 +329,87 @@ function saveState(state: IngestState): void {
 /**
  * Discover decision detail page URLs from the paginated decisions listing.
  *
- * The BWB decisions list is a TYPO3 news extension page. Pagination uses
- * query parameters: tx_news_pi1[@widget_0][currentPage]=N
+ * BWB has two decision sub-pages:
+ *   - Kartellgericht: /kartelle-marktmachtmissbrauch/entscheidungen/entscheidungen-des-kartellgerichts
+ *   - Kartellobergericht: /kartelle-marktmachtmissbrauch/entscheidungen/entscheidungen-des-kartellobergerichts
  *
- * Each item links to a detail page at:
+ * Kartellgericht uses TYPO3 news pagination:
+ *   tx_news_pi1[controller]=News&tx_news_pi1[currentPage]=N&cHash=XXX
+ * We discover pagination links from the page itself (cHash is required).
+ *
+ * Detail links point to:
  *   /kartelle_marktmachtmissbrauch/entscheidungen/detail/<slug>
+ *
+ * Kartellobergericht has a table listing (no detail links) — we extract
+ * data directly from the table in a later step (see parseKogTable).
  */
 async function discoverDecisionUrls(): Promise<string[]> {
   const urls: string[] = [];
-  console.log("\n--- Discovering decision URLs ---");
+  console.log("\n--- Discovering decision URLs (Kartellgericht) ---");
 
-  for (let page = 1; page <= MAX_DECISION_PAGES; page++) {
-    const listUrl =
-      page === 1
-        ? DECISIONS_LIST_URL
-        : `${DECISIONS_LIST_URL}?tx_news_pi1%5B%40widget_0%5D%5BcurrentPage%5D=${page}`;
+  // -- Page 1 --
+  console.log(`  Fetching Kartellgericht decisions page 1...`);
+  const firstHtml = await rateLimitedFetch(DECISIONS_KG_URL);
+  if (!firstHtml) {
+    console.warn("  [WARN] Could not fetch Kartellgericht decisions page 1");
+    return urls;
+  }
 
-    console.log(`  Fetching decisions page ${page}/${MAX_DECISION_PAGES}...`);
-    const html = await rateLimitedFetch(listUrl);
-    if (!html) {
-      console.warn(`  [WARN] Could not fetch decisions page ${page}`);
-      break;
-    }
+  let $ = cheerio.load(firstHtml);
 
-    const $ = cheerio.load(html);
-
-    // Extract links to detail pages. TYPO3 news extension uses links
-    // containing "/detail/" in the href.
-    const pageLinks: string[] = [];
-    $('a[href*="/entscheidungen/detail/"]').each((_i, el) => {
-      const href = $(el).attr("href");
+  // Extract detail links from page 1
+  const extractDetailLinks = ($page: cheerio.CheerioAPI): string[] => {
+    const links: string[] = [];
+    $page('a[href*="/entscheidungen/detail/"]').each((_i, el) => {
+      const href = $page(el).attr("href");
       if (href) {
         const absoluteUrl = href.startsWith("http")
           ? href
           : `${BASE_URL}${href.startsWith("/") ? "" : "/"}${href}`;
-        pageLinks.push(absoluteUrl.split("?")[0]!.split("#")[0]!);
+        links.push(absoluteUrl.split("?")[0]!.split("#")[0]!);
       }
     });
+    return [...new Set(links)];
+  };
 
-    if (pageLinks.length === 0) {
-      console.log(`  No more decision links found on page ${page}. Stopping.`);
-      break;
+  const page1Links = extractDetailLinks($);
+  urls.push(...page1Links);
+  console.log(`    Found ${page1Links.length} decision links on page 1`);
+
+  // Discover pagination links (TYPO3 uses cHash that we must preserve)
+  const paginationUrls: string[] = [];
+  $("a[href*='currentPage']").each((_i, el) => {
+    const href = $(el).attr("href");
+    if (href) {
+      // Decode HTML entities in href (&amp; → &)
+      const decoded = href.replace(/&amp;/g, "&");
+      const absoluteUrl = decoded.startsWith("http")
+        ? decoded
+        : `${BASE_URL}${decoded.startsWith("/") ? "" : "/"}${decoded}`;
+      paginationUrls.push(absoluteUrl);
+    }
+  });
+  const uniquePages = [...new Set(paginationUrls)];
+  console.log(`  Found ${uniquePages.length} pagination links`);
+
+  // -- Pages 2..N --
+  for (const pageUrl of uniquePages) {
+    const pageNum = pageUrl.match(/currentPage(?:%5D)?=(\d+)/)?.[1] ?? "?";
+    console.log(`  Fetching Kartellgericht decisions page ${pageNum}...`);
+    const html = await rateLimitedFetch(pageUrl);
+    if (!html) {
+      console.warn(`  [WARN] Could not fetch page ${pageNum}`);
+      continue;
     }
 
-    // Deduplicate within this page
-    const unique = [...new Set(pageLinks)];
-    urls.push(...unique);
-    console.log(`    Found ${unique.length} decision links (total: ${urls.length})`);
+    const $page = cheerio.load(html);
+    const pageLinks = extractDetailLinks($page);
+    if (pageLinks.length === 0) {
+      console.log(`    No decision links on page ${pageNum}. Stopping.`);
+      break;
+    }
+    urls.push(...pageLinks);
+    console.log(`    Found ${pageLinks.length} decision links (total: ${urls.length})`);
   }
 
   const deduped = [...new Set(urls)];
@@ -285,82 +422,93 @@ async function discoverDecisionUrls(): Promise<string[]> {
 // ---------------------------------------------------------------------------
 
 /**
- * Discover merger filing URLs from the year-based merger control pages.
+ * Extract merger filings directly from year-based table pages.
  *
- * The BWB lists mergers at /zusammenschluesse/<year> (German) and
- * /en/merger-control/<year> (English). Some years use /en/merger_control/<year>.
+ * BWB merger year pages (/zusammenschluesse/<year>) contain an HTML table
+ * with columns: Aktenzahl (case number), Unternehmen (parties), Datum des
+ * Zusammenschlusses (date), Status. There are no individual detail pages —
+ * all data is in the table rows.
  *
- * Individual mergers link to /zusammenschluesse/<year>/<id> or
- * /en/merger-control/<year>/<id>.
+ * Merger start year on the site is 2006 (not 2002).
  */
-async function discoverMergerUrls(): Promise<string[]> {
-  const urls: string[] = [];
-  console.log("\n--- Discovering merger URLs ---");
+async function discoverMergerData(): Promise<ParsedMerger[]> {
+  const mergers: ParsedMerger[] = [];
+  console.log("\n--- Extracting merger data from year tables ---");
 
   for (let year = MERGER_END_YEAR; year >= MERGER_START_YEAR; year--) {
-    // Try multiple URL patterns that the BWB site uses
-    const yearUrls = [
-      `${BASE_URL}/zusammenschluesse/${year}`,
-      `${BASE_URL}/en/merger-control/${year}`,
-      `${BASE_URL}/en/merger_control/${year}`,
-    ];
-
-    let found = false;
-    for (const yearUrl of yearUrls) {
-      console.log(`  Fetching mergers for ${year}...`);
-      const html = await rateLimitedFetch(yearUrl);
-      if (!html) continue;
-
-      const $ = cheerio.load(html);
-      const pageLinks: string[] = [];
-
-      // Look for individual merger links. These are typically table rows or
-      // list items linking to a detail page with a numeric ID.
-      $("a[href]").each((_i, el) => {
-        const href = $(el).attr("href") ?? "";
-        // Match merger detail links: /zusammenschluesse/YYYY/NNN or /merger-control/YYYY/NNN
-        if (
-          /\/(zusammenschluesse|merger-control|merger_control)\/\d{4}\/\d+/.test(href) ||
-          /\/merger\/\d+/.test(href)
-        ) {
-          const absoluteUrl = href.startsWith("http")
-            ? href
-            : `${BASE_URL}${href.startsWith("/") ? "" : "/"}${href}`;
-          pageLinks.push(absoluteUrl.split("?")[0]!.split("#")[0]!);
-        }
-      });
-
-      // Also look for table-based merger listings (BWB uses tables for merger lists)
-      $("table tbody tr").each((_i, el) => {
-        const link = $(el).find("a[href]").first();
-        const href = link.attr("href") ?? "";
-        if (href && (href.includes("zusammenschl") || href.includes("merger"))) {
-          const absoluteUrl = href.startsWith("http")
-            ? href
-            : `${BASE_URL}${href.startsWith("/") ? "" : "/"}${href}`;
-          pageLinks.push(absoluteUrl.split("?")[0]!.split("#")[0]!);
-        }
-      });
-
-      if (pageLinks.length > 0) {
-        const unique = [...new Set(pageLinks)];
-        urls.push(...unique);
-        console.log(`    Found ${unique.length} merger links for ${year} (total: ${urls.length})`);
-        found = true;
-        break; // Found valid year page, skip alternative URL patterns
-      }
+    const yearUrl = `${BASE_URL}/zusammenschluesse/${year}`;
+    console.log(`  Fetching mergers for ${year}...`);
+    const html = await rateLimitedFetch(yearUrl);
+    if (!html) {
+      console.log(`    No merger page for ${year}`);
+      continue;
     }
 
-    if (!found) {
-      // Try extracting merger info directly from the year listing page text
-      // (some years only have a table on the listing page, no detail links)
-      console.log(`    No individual merger links for ${year}`);
+    const $ = cheerio.load(html);
+    let rowCount = 0;
+
+    $("table tbody tr").each((_i, el) => {
+      const cells = $(el).find("td");
+      if (cells.length < 3) return;
+
+      const caseNumber = $(cells[0]).text().trim();
+      const parties = $(cells[1]).text().trim();
+      const dateRaw = $(cells[2]).text().trim();
+      const status = cells.length >= 4 ? $(cells[3]).text().trim() : null;
+
+      if (!caseNumber || !parties) return;
+
+      const date = parseGermanDate(dateRaw);
+
+      mergers.push({
+        case_number: caseNumber,
+        title: parties,
+        date,
+        sector: classifySector(parties, parties) ?? null,
+        acquiring_party: extractAcquiringParty(parties),
+        target: extractTarget(parties),
+        summary: status ? `${parties} — ${status}` : parties,
+        full_text: `${caseNumber} ${parties} ${dateRaw} ${status ?? ""}`.trim(),
+        outcome: classifyMergerOutcome(status ?? ""),
+        turnover: null,
+      });
+      rowCount++;
+    });
+
+    if (rowCount > 0) {
+      console.log(`    Extracted ${rowCount} merger rows for ${year} (total: ${mergers.length})`);
+    } else {
+      console.log(`    No merger table rows for ${year}`);
     }
   }
 
-  const deduped = [...new Set(urls)];
-  console.log(`  Discovered ${deduped.length} unique merger URLs`);
-  return deduped;
+  console.log(`  Extracted ${mergers.length} total merger filings`);
+  return mergers;
+}
+
+/** Extract acquiring party from BWB merger parties string. */
+function extractAcquiringParty(parties: string): string | null {
+  // Parties are often separated by ; — first entity is typically acquirer
+  const parts = parties.split(";").map((s) => s.trim()).filter(Boolean);
+  return parts.length > 0 ? parts[0]! : null;
+}
+
+/** Extract target from BWB merger parties string. */
+function extractTarget(parties: string): string | null {
+  const parts = parties.split(";").map((s) => s.trim()).filter(Boolean);
+  return parts.length > 1 ? parts.slice(1).join("; ") : null;
+}
+
+/** Classify merger outcome from status text. */
+function classifyMergerOutcome(status: string): string | null {
+  const text = status.toLowerCase();
+  if (text.includes("fristablauf") || text.includes("freigabe")) return "cleared_phase1";
+  if (text.includes("phase 2") || text.includes("phase ii")) return "cleared_phase2";
+  if (text.includes("auflagen") || text.includes("bedingung")) return "cleared_with_conditions";
+  if (text.includes("untersagt") || text.includes("verboten")) return "blocked";
+  if (text.includes("zurückgezogen") || text.includes("zurückziehung")) return "withdrawn";
+  if (text.includes("angemeldet")) return "pending";
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -1465,16 +1613,19 @@ async function main(): Promise<void> {
   console.log(`  Force:      ${force}`);
   console.log("");
 
+  // Solve Sucuri WAF challenge before any requests
+  await solveSucuriChallenge();
+
   // Load resume state
   const state = loadState();
   const processedSet = new Set(state.processedUrls);
 
   // -----------------------------------------------------------------------
-  // Step 1: Discover all URLs
+  // Step 1: Discover decision URLs and extract merger data from tables
   // -----------------------------------------------------------------------
 
   const decisionUrls = await discoverDecisionUrls();
-  const mergerUrls = await discoverMergerUrls();
+  const mergerData = await discoverMergerData();
   const newsUrls = await discoverNewsUrls();
 
   // Combine decision and news URLs (both produce decision records)
@@ -1484,28 +1635,22 @@ async function main(): Promise<void> {
   const decisionUrlsToProcess = resume
     ? allDecisionUrls.filter((u) => !processedSet.has(u))
     : allDecisionUrls;
-  const mergerUrlsToProcess = resume
-    ? mergerUrls.filter((u) => !processedSet.has(u))
-    : mergerUrls;
 
-  const totalUrls = decisionUrlsToProcess.length + mergerUrlsToProcess.length;
+  const totalItems = decisionUrlsToProcess.length + mergerData.length;
 
   console.log(`\n--- Processing summary ---`);
   console.log(`  Decision/news URLs: ${decisionUrlsToProcess.length}`);
-  console.log(`  Merger URLs:        ${mergerUrlsToProcess.length}`);
-  console.log(`  Total:              ${totalUrls}`);
+  console.log(`  Merger table rows:  ${mergerData.length}`);
+  console.log(`  Total:              ${totalItems}`);
 
   if (resume) {
-    const skipped =
-      allDecisionUrls.length +
-      mergerUrls.length -
-      totalUrls;
+    const skipped = allDecisionUrls.length - decisionUrlsToProcess.length;
     if (skipped > 0) {
       console.log(`  Skipping ${skipped} already-processed URLs`);
     }
   }
 
-  if (totalUrls === 0) {
+  if (totalItems === 0) {
     console.log("\nNothing to process. Exiting.");
     return;
   }
@@ -1537,7 +1682,7 @@ async function main(): Promise<void> {
 
   for (const url of decisionUrlsToProcess) {
     processed++;
-    const progress = `[${processed}/${totalUrls}]`;
+    const progress = `[${processed}/${decisionUrlsToProcess.length}]`;
 
     try {
       console.log(`${progress} Fetching: ${url}`);
@@ -1644,127 +1789,41 @@ async function main(): Promise<void> {
   }
 
   // -----------------------------------------------------------------------
-  // Step 4: Process merger detail pages
+  // Step 4: Insert merger data (already extracted from year-page tables)
   // -----------------------------------------------------------------------
 
-  console.log(`\n--- Processing ${mergerUrlsToProcess.length} merger pages ---`);
+  console.log(`\n--- Inserting ${mergerData.length} merger records ---`);
 
-  for (const url of mergerUrlsToProcess) {
-    processed++;
-    const progress = `[${processed}/${totalUrls}]`;
-
-    try {
-      console.log(`${progress} Fetching: ${url}`);
-      const html = await rateLimitedFetch(url);
-      if (!html) {
-        console.warn(`${progress} SKIP (fetch failed): ${url}`);
-        state.errors.push(`fetch-failed: ${url}`);
-        errors++;
-        continue;
-      }
-
-      // Check if this is a detail page or a listing page
-      const isDetailPage =
-        /\/\d{4}\/\d+$/.test(url) || url.includes("/merger/");
-
-      if (isDetailPage) {
-        const { merger } = parseDecisionPage(html, url);
-        if (merger) {
-          if (dryRun) {
-            console.log(
-              `${progress} [DRY RUN] Would insert merger: ${merger.case_number} — ${merger.title.slice(0, 80)}`,
-            );
-          } else {
-            stmts!.upsertMerger.run(
-              merger.case_number,
-              merger.title,
-              merger.date,
-              merger.sector,
-              merger.acquiring_party,
-              merger.target,
-              merger.summary,
-              merger.full_text,
-              merger.outcome,
-              merger.turnover,
-            );
-            mergersIngested++;
-            console.log(
-              `${progress} Merger: ${merger.case_number} — ${merger.title.slice(0, 80)}`,
-            );
-          }
-
-          if (merger.sector) {
-            const s = sectorAcc[merger.sector] ??= {
-              name: SECTOR_NAMES[merger.sector]?.name ?? merger.sector,
-              name_en: SECTOR_NAMES[merger.sector]?.name_en ?? null,
-              description: SECTOR_NAMES[merger.sector]?.description ?? null,
-              decisionCount: 0,
-              mergerCount: 0,
-            };
-            s.mergerCount++;
-          }
-        } else {
-          console.log(`${progress} SKIP (no merger data extracted): ${url}`);
-        }
-      } else {
-        // This is a year listing page — parse the table
-        const yearMatch = url.match(/\/(\d{4})/);
-        const year = yearMatch ? parseInt(yearMatch[1]!, 10) : MERGER_END_YEAR;
-        const tableMergers = parseMergerListingPage(html, year);
-
-        for (const merger of tableMergers) {
-          if (dryRun) {
-            console.log(
-              `${progress} [DRY RUN] Would insert merger from table: ${merger.case_number} — ${merger.title.slice(0, 80)}`,
-            );
-          } else {
-            stmts!.upsertMerger.run(
-              merger.case_number,
-              merger.title,
-              merger.date,
-              merger.sector,
-              merger.acquiring_party,
-              merger.target,
-              merger.summary,
-              merger.full_text,
-              merger.outcome,
-              merger.turnover,
-            );
-            mergersIngested++;
-          }
-
-          if (merger.sector) {
-            const s = sectorAcc[merger.sector] ??= {
-              name: SECTOR_NAMES[merger.sector]?.name ?? merger.sector,
-              name_en: SECTOR_NAMES[merger.sector]?.name_en ?? null,
-              description: SECTOR_NAMES[merger.sector]?.description ?? null,
-              decisionCount: 0,
-              mergerCount: 0,
-            };
-            s.mergerCount++;
-          }
-        }
-
-        if (tableMergers.length > 0) {
-          console.log(
-            `${progress} Extracted ${tableMergers.length} mergers from table (${year})`,
-          );
-        }
-      }
-
-      state.processedUrls.push(url);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      console.error(`${progress} ERROR: ${url}: ${message}`);
-      state.errors.push(`error: ${url}: ${message}`);
-      errors++;
+  for (const merger of mergerData) {
+    if (dryRun) {
+      console.log(
+        `  [DRY RUN] Would insert merger: ${merger.case_number} — ${merger.title.slice(0, 80)}`,
+      );
+    } else {
+      stmts!.upsertMerger.run(
+        merger.case_number,
+        merger.title,
+        merger.date,
+        merger.sector,
+        merger.acquiring_party,
+        merger.target,
+        merger.summary,
+        merger.full_text,
+        merger.outcome,
+        merger.turnover,
+      );
+      mergersIngested++;
     }
 
-    // Save state periodically
-    if (!dryRun && processed % 25 === 0) {
-      state.decisionsIngested = decisionsIngested;
-      state.mergersIngested = mergersIngested;
-      saveState(state);
+    if (merger.sector) {
+      const s = sectorAcc[merger.sector] ??= {
+        name: SECTOR_NAMES[merger.sector]?.name ?? merger.sector,
+        name_en: SECTOR_NAMES[merger.sector]?.name_en ?? null,
+        description: SECTOR_NAMES[merger.sector]?.description ?? null,
+        decisionCount: 0,
+        mergerCount: 0,
+      };
+      s.mergerCount++;
     }
   }
 
@@ -1837,7 +1896,7 @@ async function main(): Promise<void> {
   } else {
     console.log("\n=== Dry run complete ===");
     console.log(`  Decision URLs found: ${decisionUrlsToProcess.length}`);
-    console.log(`  Merger URLs found:   ${mergerUrlsToProcess.length}`);
+    console.log(`  Merger rows found:   ${mergerData.length}`);
     console.log(`  Errors:              ${errors}`);
   }
 }
