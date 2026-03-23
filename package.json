@@ -5,13 +5,37 @@
   "description": "BWB (Austrian Federal Competition Authority) MCP server — competition law decisions, merger control, and sector enforcement",
   "type": "module",
   "main": "dist/src/index.js",
-  "bin": { "austrian-competition-mcp": "dist/src/index.js" },
-  "files": ["dist", "server.json"],
-  "engines": { "node": ">=20" },
-  "repository": { "type": "git", "url": "git+https://github.com/Ansvar-Systems/austrian-competition-mcp.git" },
-  "bugs": { "url": "https://github.com/Ansvar-Systems/austrian-competition-mcp/issues" },
+  "bin": {
+    "austrian-competition-mcp": "dist/src/index.js"
+  },
+  "files": [
+    "dist",
+    "server.json"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Ansvar-Systems/austrian-competition-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Ansvar-Systems/austrian-competition-mcp/issues"
+  },
   "homepage": "https://github.com/Ansvar-Systems/austrian-competition-mcp#readme",
-  "keywords": ["mcp", "model-context-protocol", "ai", "claude", "bwb", "austrian-competition", "austria", "antitrust", "merger-control", "compliance", "ansvar"],
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "ai",
+    "claude",
+    "bwb",
+    "austrian-competition",
+    "austria",
+    "antitrust",
+    "merger-control",
+    "compliance",
+    "ansvar"
+  ],
   "author": "Ansvar Systems AB <hello@ansvar.ai>",
   "license": "Apache-2.0",
   "scripts": {
@@ -19,6 +43,7 @@
     "dev": "tsx src/http-server.ts",
     "start": "node dist/src/http-server.js",
     "seed": "npx tsx scripts/seed-sample.ts",
+    "ingest": "npx tsx scripts/ingest-bwb.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "lint": "tsc --noEmit"
   },
@@ -31,6 +56,7 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.26.0",
     "better-sqlite3": "^9.4.3",
+    "cheerio": "^1.2.0",
     "zod": "^3.22.4"
   }
 }
