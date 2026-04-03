@@ -1,11 +1,38 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "eu.ansvar/austrian-competition-mcp",
-  "description": "Query BWB (Austrian Federal Competition Authority) decisions, merger control cases, and sector enforcement activity under Austrian competition law (KartG)",
-  "repository": { "url": "https://github.com/Ansvar-Systems/austrian-competition-mcp", "source": "github" },
+  "description": "BWB (Austrian Federal Competition Authority) MCP server — competition law decisions, merger control, and sector enforcement",
+  "repository": {
+    "url": "https://github.com/Ansvar-Systems/austrian-competition-mcp",
+    "source": "github"
+  },
   "homepage": "https://ansvar.eu",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "license": "Apache-2.0",
-  "keywords": ["bwb", "austrian-competition", "austria", "antitrust", "merger-control", "competition-law", "compliance", "mcp", "ansvar"],
-  "packages": [{ "registryType": "npm", "identifier": "@ansvar/austrian-competition-mcp", "version": "0.1.0", "transport": { "type": "stdio" } }]
+  "keywords": [
+    "competition",
+    "austria",
+    "regulation",
+    "compliance",
+    "mcp"
+  ],
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@ansvar/austrian-competition-mcp",
+      "version": "1.0.0",
+      "transport": {
+        "type": "stdio"
+      }
+    },
+    {
+      "registryType": "npm",
+      "identifier": "@ansvar/austrian-competition-mcp",
+      "version": "1.0.0",
+      "transport": {
+        "type": "streamable-http",
+        "url": "https://mcp.ansvar.eu/austrian-competition/mcp"
+      }
+    }
+  ]
 }
