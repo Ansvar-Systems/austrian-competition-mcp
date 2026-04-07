@@ -18,6 +18,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { searchDecisions, getDecision, searchMergers, getMerger, listSectors } from "./db.js";
+import { buildCitation } from './citation.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -121,7 +122,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const parsed = GetDecisionArgs.parse(args);
         const decision = getDecision(parsed.case_number);
         if (!decision) return errorContent(`Decision not found: ${parsed.case_number}`);
-        return textContent(decision);
+        return textContent({
+          ...(typeof decision === 'object' ? decision : { data: decision }),
+          _citation: buildCitation(
+            decision.case_number || parsed.case_number,
+            decision.title || decision.subject || parsed.case_number,
+            'at_comp_get_decision',
+            { case_number: parsed.case_number },
+            decision.url || decision.source_url || null,
+          ),
+        });
       }
       case "at_comp_search_mergers": {
         const parsed = SearchMergersArgs.parse(args);
@@ -132,7 +142,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const parsed = GetMergerArgs.parse(args);
         const merger = getMerger(parsed.case_number);
         if (!merger) return errorContent(`Merger case not found: ${parsed.case_number}`);
-        return textContent(merger);
+        return textContent({
+          ...(typeof merger === 'object' ? merger : { data: merger }),
+          _citation: buildCitation(
+            merger.case_number || parsed.case_number,
+            merger.title || merger.subject || parsed.case_number,
+            'at_comp_get_merger',
+            { case_number: parsed.case_number },
+            merger.url || merger.source_url || null,
+          ),
+        });
       }
       case "at_comp_list_sectors": {
         const sectors = listSectors();
